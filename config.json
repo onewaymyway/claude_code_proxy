@@ -1,0 +1,33 @@
+{
+  "nvidia": {
+    "api_key": "nvapi-xxxx",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "model": "stepfun-ai/step-3.5-flash",
+    "timeout": 1200000
+  },
+  "proxy": {
+    "host": "0.0.0.0",
+    "port": 8082
+  },
+  "defaults": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_tokens": 88192
+  },
+  "log": {
+    "level": "INFO",
+    "format": "%(asctime)s [%(levelname)s] %(message)s"
+  },
+  "debug": {
+    "enabled": true,
+    "print_request": true,
+    "print_response": true,
+    "print_stream_chunks": true,
+    "max_content_length": 0,
+    "print_raw_body": true,
+    "file_log": {
+      "enabled": true,
+      "log_dir": "./proxy_log"
+    }
+  }
+}
