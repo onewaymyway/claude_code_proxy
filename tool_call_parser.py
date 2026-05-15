@@ -349,12 +349,20 @@ _PARSERS = [
     ("F6", _parse_f6),
 ]
 
-
+def has_key_words(text,keywords):
+    for keyword in keywords:
+        if keyword in text:
+            return True
+    return False
 def parse(text: str) -> ParseResult:
     """
     主解析函数。
     按优先级尝试所有格式，去重（同名+同参数视为重复），返回 ParseResult。
     """
+
+    if not has_key_words(text.lower(),["tool_use","tool_call"]):
+        return ParseResult(tool_calls=[], pure_text=text)
+
     all_calls: list[ToolCall] = []
     seen: set[tuple] = set()   # 去重 key = (name, frozenset(input.items()))
 
