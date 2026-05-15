@@ -616,10 +616,18 @@ def openai_to_anthropic(openai_resp: dict, model: str) -> dict:
     """非流式响应转换，含工具调用解析"""
     msg_id   = f"msg_{uuid.uuid4().hex[:24]}"
     choices  = openai_resp.get("choices", [])
-    raw_text = choices[0]["message"]["content"] if choices else ""
+    raw_text=""
+    reasoning=""
+    if choices:
+        raw_text = choices[0]["message"].get("content","")
+        reasoning=choices[0]["message"].get("reasoning_content","")
     usage    = openai_resp.get("usage", {})
 
-    pure_text, tool_calls = split_text_and_tools(raw_text)
+    use_text=raw_text
+    if not raw_text:
+        raw_text=reasoning
+
+    pure_text, tool_calls = split_text_and_tools(use_text)
 
     content_blocks = []
     if pure_text:
@@ -838,143 +846,329 @@ async def messages(request: Request):
     url     = f"{NVIDIA_BASE_URL}/chat/completions"
 
     # ── 流式 ──────────────────────────────────────────────────────────────────
+    # ── 流式 ──────────────────────────────────────────────────────────────────
     if openai_req.get("stream"):
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
-        # ── 生成器外部先建连接并检查 status_code ─────────────────────────────
-        # HTTP 200 发出之前可以 raise HTTPException，错误码完整透传给 Claude Code
-        try:
-            _stream_client = _http_client()
-            _stream_resp = await _stream_client.send(
-                _stream_client.build_request("POST", url, json=openai_req, headers=headers),
-                stream=True,
-            )
-        except Exception as e:
-            await _stream_client.aclose()
-            err_msg = f"[代理异常] {type(e).__name__}: {e}"
-            logger.error(f"[#{req_id}] 流式连接失败: {e}", exc_info=True)
-            dbg_error(req_id, 0, str(e))
-            file_logger.finish(req_id=req_id, response=None, elapsed=0,
-                               tool_calls=[], error=err_msg, raw_model_output=None)
-            active_requests.unregister(req_id)
-            raise HTTPException(status_code=502, detail=err_msg)
-
-        if _stream_resp.status_code != 200:
-            err = (await _stream_resp.aread()).decode()
-            await _stream_client.aclose()
-            err_msg = f"上游 API 错误 {_stream_resp.status_code}: {err or '(无响应体)'}"
-            logger.error(f"[#{req_id}] {err_msg}")
-            dbg_error(req_id, _stream_resp.status_code, err)
-            file_logger.finish(req_id=req_id, response=None, elapsed=0,
-                               tool_calls=[], error=err_msg, raw_model_output=err)
-            active_requests.unregister(req_id)
-            raise HTTPException(status_code=_stream_resp.status_code, detail=err_msg)
-
         async def event_gen() -> AsyncGenerator[str, None]:
-            start = {"type": "message_start", "message": {
-                "id": msg_id, "type": "message", "role": "assistant",
-                "content": [], "model": model,
-                "stop_reason": None, "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
-            }}
+            start = {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                },
+            }
+
             yield f"event: message_start\ndata: {json.dumps(start)}\n\n"
-            yield (f"event: content_block_start\ndata: "
-                   f"{json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n")
+
+            yield (
+                f"event: content_block_start\ndata: "
+                f"{json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
+            )
+
             yield "event: ping\ndata: {\"type\": \"ping\"}\n\n"
 
-            t0          = time.time()
-            full_text   = []
-            chars       = 0
+            t0 = time.time()
+
+            full_text = []
+            reasoning_text=[]
+            chars = 0
             chunk_total = 0
-            chunk_ok    = 0
+            chunk_ok = 0
+
             dbg_stream_start(req_id)
 
             try:
-                async with _stream_resp:
-                    async for line in _stream_resp.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        ds = line[5:].strip()
-                        if ds == "[DONE]":
-                            break
-                        chunk_total += 1
-                        try:
-                            chunk = json.loads(ds)
-                            chunk_ok += 1
-                        except json.JSONDecodeError:
-                            logger.debug(f"[#{req_id}] chunk JSON 解析失败，跳过: {ds[:80]}")
-                            continue
+                async with _http_client() as client:
 
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            continue
-                        content = choices[0].get("delta", {}).get("content", "")
-                        if content:
-                            full_text.append(content)
-                            chars += len(content)
-                            dbg_stream_chunk(content)
-                            ev = {"type": "content_block_delta", "index": 0,
-                                  "delta": {"type": "text_delta", "text": content}}
-                            yield f"event: content_block_delta\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                    async with client.stream(
+                        "POST",
+                        url,
+                        json=openai_req,
+                        headers=headers,
+                    ) as resp:
+
+                        # ── HTTP 状态检查 ─────────────────────────────
+                        if resp.status_code != 200:
+                            err_bytes = await resp.aread()
+                            err_text = err_bytes.decode(errors="ignore")
+
+                            err_msg = (
+                                f"上游 API 错误 {resp.status_code}: "
+                                f"{err_text or '(无响应体)'}"
+                            )
+
+                            logger.error(f"[#{req_id}] {err_msg}")
+                            dbg_error(req_id, resp.status_code, err_text)
+
+                            file_logger.finish(
+                                req_id=req_id,
+                                response=None,
+                                elapsed=0,
+                                tool_calls=[],
+                                error=err_msg,
+                                raw_model_output=err_text,
+                            )
+
+                            active_requests.unregister(req_id)
+
+                            yield (
+                                "event: error\n"
+                                f"data: {json.dumps({'error': err_msg}, ensure_ascii=False)}\n\n"
+                            )
+
+                            return
+
+                        # ── 读取 SSE 数据 ────────────────────────────
+                        async for line in resp.aiter_lines():
+
+                            # if not line.startswith("data:"):
+                            #     continue
+
+                            # ds = line[5:].strip()
+
+                            if not line:
+                                continue
+
+                            # print("line",line)
+
+                            # OpenAI SSE 标准格式
+                            if line.startswith("data:"):
+                                ds = line[5:].strip()
+                            else:
+                                # 某些兼容服务直接返回 JSON
+                                ds = line
+
+                            if ds == "[DONE]":
+                                break
+
+                            chunk_total += 1
+
+                            try:
+                                chunk = json.loads(ds)
+                                chunk_ok += 1
+
+                            except json.JSONDecodeError:
+                                logger.debug(
+                                    f"[#{req_id}] chunk JSON 解析失败，跳过: {ds[:80]}"
+                                )
+                                continue
+
+                            choices = chunk.get("choices", [])
+
+                            if not choices:
+                                continue
+
+                            delta=choices[0].get("delta", {})
+
+                            reasoning = delta.get("reasoning_content", "")
+
+                            content = delta.get("content", "")
+
+                            if reasoning:
+                                reasoning_text.append(reasoning)
+                                chars += len(reasoning)
+
+                                dbg_stream_chunk(reasoning)
+
+                                ev = {
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {
+                                        "type": "text_delta",
+                                        "text": reasoning,
+                                    },
+                                }
+
+                                yield (
+                                    f"event: content_block_delta\n"
+                                    f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                                )
+
+
+
+
+
+                            if content:
+                                full_text.append(content)
+                                chars += len(content)
+
+                                dbg_stream_chunk(content)
+
+                                ev = {
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {
+                                        "type": "text_delta",
+                                        "text": content,
+                                    },
+                                }
+
+                                yield (
+                                    f"event: content_block_delta\n"
+                                    f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                                )
 
             except Exception as e:
-                # HTTP 200 已发出，无法再改状态码，记日志后断流，客户端会感知连接中断
-                logger.error(f"[#{req_id}] stream 读取异常: {e}", exc_info=True)
+                logger.error(
+                    f"[#{req_id}] stream 读取异常: {e}",
+                    exc_info=True,
+                )
+
                 dbg_error(req_id, 0, str(e))
+
                 err_msg = f"[代理异常] {type(e).__name__}: {e}"
-                file_logger.finish(req_id=req_id, response=None,
-                                   elapsed=time.time()-t0, tool_calls=[],
-                                   error=err_msg, raw_model_output="".join(full_text) or None)
+
+                file_logger.finish(
+                    req_id=req_id,
+                    response=None,
+                    elapsed=time.time() - t0,
+                    tool_calls=[],
+                    error=err_msg,
+                    raw_model_output="".join(full_text) or None,
+                )
+
                 active_requests.unregister(req_id)
-                await _stream_client.aclose()
+
+                yield (
+                    "event: error\n"
+                    f"data: {json.dumps({'error': err_msg}, ensure_ascii=False)}\n\n"
+                )
+
                 return
 
-            await _stream_client.aclose()
+            # ── 全部 chunk 都无法解析 ────────────────────────────
+            all_texts=reasoning_text+full_text
+            if chunk_total > 0 and chunk_ok == 0 and not all_texts:
 
-            # ── chunk 全部解析失败：同上，HTTP 200 已发出，断流 ───────────────
-            if chunk_total > 0 and chunk_ok == 0 and not full_text:
-                err_msg = f"[代理错误] 上游返回了 {chunk_total} 个无法解析的 SSE chunk"
+                err_msg = (
+                    f"[代理错误] 上游返回了 "
+                    f"{chunk_total} 个无法解析的 SSE chunk"
+                )
+
                 logger.error(f"[#{req_id}] {err_msg}")
+
                 dbg_error(req_id, 0, err_msg)
-                file_logger.finish(req_id=req_id, response=None, elapsed=time.time()-t0,
-                                   tool_calls=[], error=err_msg, raw_model_output=None)
+
+                file_logger.finish(
+                    req_id=req_id,
+                    response=None,
+                    elapsed=time.time() - t0,
+                    tool_calls=[],
+                    error=err_msg,
+                    raw_model_output=None,
+                )
+
                 active_requests.unregister(req_id)
+
+                yield (
+                    "event: error\n"
+                    f"data: {json.dumps({'error': err_msg}, ensure_ascii=False)}\n\n"
+                )
+
                 return
 
-            # ── 流结束后解析工具调用 ──────────────────────────────────────────
+            # ── 解析工具调用 ────────────────────────────────────
             active_requests.update_phase(req_id, "parsing")
-            combined  = "".join(full_text)
+
+
+            if full_text:
+                combined = "".join(full_text)
+            else:
+                combined = "".join(all_texts)
+
+            temp=[]
+            if reasoning_text:
+                temp+=["<think>","".join(reasoning_text),"</think>"]
+            if full_text:
+                temp+=["".join(full_text)]
+            raw_input_str="".join(temp)
+
             pure_text, tool_calls = split_text_and_tools(combined)
 
-            yield "event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n"
+            yield (
+                "event: content_block_stop\n"
+                "data: {\"type\": \"content_block_stop\", \"index\": 0}\n\n"
+            )
 
             if tool_calls:
-                logger.info(f"[#{req_id}] 检测到 {len(tool_calls)} 个工具调用，注入 tool_use 事件")
-                for ev in build_tool_use_sse_events(tool_calls, start_index=1):
-                    yield ev
-                stop_ev = {"type": "message_delta",
-                           "delta": {"stop_reason": "tool_use", "stop_sequence": None},
-                           "usage": {"output_tokens": chars}}
-            else:
-                stop_ev = {"type": "message_delta",
-                           "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                           "usage": {"output_tokens": chars}}
+                logger.info(
+                    f"[#{req_id}] 检测到 {len(tool_calls)} 个工具调用"
+                )
 
-            yield f"event: message_delta\ndata: {json.dumps(stop_ev)}\n\n"
-            yield "event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
+                for ev in build_tool_use_sse_events(
+                    tool_calls,
+                    start_index=1,
+                ):
+                    yield ev
+
+                stop_ev = {
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "tool_use",
+                        "stop_sequence": None,
+                    },
+                    "usage": {
+                        "output_tokens": chars,
+                    },
+                }
+
+            else:
+                stop_ev = {
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "end_turn",
+                        "stop_sequence": None,
+                    },
+                    "usage": {
+                        "output_tokens": chars,
+                    },
+                }
+
+            yield (
+                f"event: message_delta\n"
+                f"data: {json.dumps(stop_ev)}\n\n"
+            )
+
+            yield (
+                "event: message_stop\n"
+                "data: {\"type\": \"message_stop\"}\n\n"
+            )
 
             elapsed = time.time() - t0
+
             dbg_stream_end(req_id, elapsed, chars, tool_calls)
+
             file_logger.finish(
                 req_id=req_id,
-                response={"text": pure_text, "tool_calls": tool_calls},
-                elapsed=elapsed, tool_calls=tool_calls,
-                raw_model_output=combined,
+                response={
+                    "text": pure_text,
+                    "tool_calls": tool_calls,
+                },
+                elapsed=elapsed,
+                tool_calls=tool_calls,
+                raw_model_output=raw_input_str,
             )
+
             active_requests.unregister(req_id)
 
-        return StreamingResponse(event_gen(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        return StreamingResponse(
+            event_gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     # ── 非流式 ────────────────────────────────────────────────────────────────
     t0 = time.time()
@@ -1004,7 +1198,14 @@ async def messages(request: Request):
 
     openai_resp = resp.json()
     nr_choices  = openai_resp.get("choices", [])
-    raw_model_output_nr = nr_choices[0]["message"]["content"] if nr_choices else ""
+    raw_model_output_nr=""
+    if nr_choices:
+
+        raw_model_output_nr = nr_choices[0]["message"].get("content","")
+        reasoning=nr_choices[0]["message"].get("reasoning_content","")
+        if reasoning:
+            raw_model_output_nr="".join(["<think>",reasoning,"</think>",raw_model_output_nr])
+        
     ar = openai_to_anthropic(openai_resp, model)
     summary = " | ".join(
         b.get("text", b.get("name", "")) for b in ar["content"]
